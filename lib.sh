@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+#set -x
 set -eEuo pipefail
 shopt -s inherit_errexit
 
@@ -51,12 +52,6 @@ NC='\033[0m'
 : "${ISBN_IGNORED_FILES:="^(image/(gif|svg.+)|application/(x-shockwave-flash|CDFV2|vnd.ms-opentype|x-font-ttf|x-dosexec|vnd.ms-excel|x-java-applet)|audio/.+|video/.+)\$"}"
 : "${ISBN_RET_SEPARATOR:=,}"
 
-# This is matched against normalized valid-looking ISBNs and any numbers that
-# match it are discarded.
-# The default value should match 0123456789 and any ISBN-10 that uses only one
-# digit (e.g. 1111111111 or 3333333333)
-: "${ISBN_BLACKLIST_REGEX="^(0123456789|([0-9xX])\\2{9})\$"}"
-
 # These options specify if and how we should reorder ISBN_DIRECT_GREP files
 # before passing them to find_isbns(). If true, the first
 # ISBN_GREP_RF_SCAN_FIRST lines of the files are passed as is, then we pass
@@ -73,11 +68,9 @@ NC='\033[0m'
 : "${OCR_ONLY_FIRST_LAST_PAGES:=7,3}"
 : "${OCR_COMMAND:=tesseract_wrapper}"
 
-# Set to empty string if using Calibre versions before 2.84, previous versions did not support the
-# --allowed-plugin option that we use to search for metadata in the order specified below, so they
-# can search in all enabled sources in the GUI.
-: "${ISBN_METADATA_FETCH_ORDER="Goodreads,Amazon.com,Google,ISBNDB,WorldCat xISBN,OZON.ru"}"
-: "${ORGANIZE_WITHOUT_ISBN_SOURCES="Goodreads,Amazon.com,Google"}"
+# Require Calibre 2.84+, previous versions will search in all enabled sources in the GUI
+: "${ISBN_METADATA_FETCH_ORDER:="Goodreads,Amazon.com,Google,ISBNDB,WorldCat xISBN,OZON.ru"}"
+: "${ORGANIZE_WITHOUT_ISBN_SOURCES:="Goodreads,Amazon.com,Google"}"
 
 # Should be matched against a lowercase filename.ext, lines that start with #
 # and newlines are removed. The default value should filter out most periodicals
@@ -117,7 +110,6 @@ handle_script_arg() {
 
 		--tested-archive-extensions=*) TESTED_ARCHIVE_EXTENSIONS="${arg#*=}" ;;
 		-i=*|--isbn-regex=*) ISBN_REGEX="${arg#*=}" ;;
-		--isbn-blacklist-regex=*) ISBN_BLACKLIST_REGEX="${arg#*=}" ;;
 		--isbn-direct-grep-files=*) ISBN_DIRECT_GREP_FILES="${arg#*=}" ;;
 		--isbn-ignored-files=*) ISBN_IGNORED_FILES="${arg#*=}" ;;
 		--reorder-files-for-grep=*)
@@ -146,11 +138,6 @@ handle_script_arg() {
 		-ome=*|--output-metadata-extension=*) OUTPUT_METADATA_EXTENSION="${arg#*=}" ;;
 
 		--debug-prefix-length=*) DEBUG_PREFIX_LENGTH="${arg#*=}" ;;
-
-		--lib-hook=*)
-			# shellcheck source=/dev/null
-			source "${arg#*=}"
-		;;
 
 		-*) echo "Invalid option '$arg'"; exit 4; ;;
 	esac
@@ -296,12 +283,6 @@ find_isbns() {
 				echo "$isbn"
 			fi
 		done
-	} | {
-		if [ "$ISBN_BLACKLIST_REGEX" != "" ]; then
-			grep -vP "$ISBN_BLACKLIST_REGEX" || true
-		else
-			cat
-		fi
 	} | stream_concat "$ISBN_RET_SEPARATOR"
 }
 
@@ -664,41 +645,129 @@ move_or_link_file() {
 
 # Arguments: new_folder, current_ebook_path, current_metadata_path
 move_or_link_ebook_file_and_metadata() {
-	local new_folder="$1" current_ebook_path="$2" current_metadata_path="$3" line
-	declare -A d=( ["EXT"]="${current_ebook_path##*.}" ) # metadata and the file extension
+    local new_folder="$1" current_ebook_path="$2" current_metadata_path="$3" line key="" value
+    declare -A d=( ["EXT"]="${current_ebook_path##*.}" )
 
-	while IFS='' read -r line || [[ -n "$line" ]]; do
-		#TODO: fix this properly
-		d["$(echo "${line%%:*}" | sed -e 's/[ \t]*$//' -e 's/ /_/g' -e 's/[^a-zA-Z0-9_]//g' -e 's/\(.*\)/\U\1/')"]="$(echo "${line#*: }" | sed -e 's/[\\/\*\?<>\|\x01-\x1F\x7F\x22\x24\x60]/_/g' | cut -c 1-100 )"
-	done < "$current_metadata_path"
+    # Use the passed new_folder and ensure it’s writable
+    decho "Ensuring directory '$new_folder' exists and is writable..."
+    mkdir -p "$new_folder" || { decho "ERROR: Failed to create directory '$new_folder'"; exit 1; }
+    [ -w "$new_folder" ] || { decho "ERROR: No write permissions for '$new_folder'"; exit 1; }
 
-	decho "Variables that will be used for the new filename construction:"
-	local key
-	for key in "${!d[@]}"; do
-		echo "${d[${key}]}" | debug_prefixer "    ${key}" 25
-	done
+    # Verify source file exists
+    [ -f "$current_ebook_path" ] || { decho "ERROR: Source file '$current_ebook_path' does not exist"; exit 1; }
 
-	local new_name
-	new_name="$(eval echo "$OUTPUT_FILENAME_TEMPLATE")"
-	decho "The new file name of the book file/link '$current_ebook_path' will be: '$new_name'"
+    # Preprocess metadata and debug raw content
+    decho "Preprocessing metadata from '$current_metadata_path'..."
+    local tmp_file=$(mktemp)
+    if ! sed "s/^b'//; s/'$//; s/\\n/\n/g" "$current_metadata_path" > "$tmp_file"; then
+        decho "ERROR: Failed to preprocess metadata"
+        exit 1
+    fi
+    decho "Raw metadata content from '$current_metadata_path':"
+    cat "$current_metadata_path" | debug_prefixer "    [original] " 25
+    decho "Processed metadata content in '$tmp_file':"
+    cat "$tmp_file" | debug_prefixer "    [processed] " 25
 
-	local new_path
-	new_path="$(unique_filename "${new_folder%/}" "$new_name")"
-	echo -n "$new_path"
+    # Parse metadata with robust handling
+    decho "Parsing metadata from '$tmp_file'..."
+    while IFS=':' read -r key_part value_part || [[ -n "$key_part" ]]; do
+        [[ -z "$key_part" ]] && continue
+        key=$(echo "$key_part" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//' -e 's/ /_/g' -e 's/[^a-zA-Z0-9_]//g' -e 's/\(.*\)/\U\1/')
+        value=$(echo "$value_part" | sed -e 's/^[ \t]*//' -e 's/[\\/\*\?<>\|\x01-\x1F\x7F\x22\x24\x60]/_/g')
+        if [[ "$key" == "TITLE" ]]; then
+            if [[ "$value" =~ _n ]]; then
+                # Split multi-line TITLE safely
+                decho "Splitting multi-line TITLE: '$value'"
+                echo "$value" | tr '_n' '\n' | while IFS=':' read -r sub_key sub_value || [[ -n "$sub_key" ]]; do
+                    [[ -z "$sub_key" ]] && continue
+                    sub_key=$(echo "$sub_key" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//' -e 's/ /_/g' -e 's/[^a-zA-Z0-9_]//g' -e 's/\(.*\)/\U\1/' -e 's/AUTHOR_S/AUTHORS/')
+                    sub_value=$(echo "$sub_value" | sed -e 's/^[ \t]*//' -e 's/[\\/\*\?<>\|\x01-\x1F\x7F\x22\x24\x60]/_/g')
+                    if [[ -z "$sub_value" && -z "${d[TITLE]+x}" ]]; then
+                        d["TITLE"]="$sub_key"
+                        decho "Set d[TITLE]='$sub_key' (from TITLE split, no colon)"
+                    elif [[ -n "$sub_key" && -n "$sub_value" ]]; then
+                        d["$sub_key"]="$sub_value"
+                        decho "Set d[$sub_key]='$sub_value' (from TITLE split)"
+                    fi
+                done
+            else
+                d["TITLE"]="$value"
+                decho "Set d[TITLE]='$value' (single-line TITLE)"
+            fi
+        elif [[ -n "$key" && -n "$value" ]]; then
+            # Normalize AUTHOR(S) to AUTHORS
+            [[ "$key" == "AUTHOR_S" ]] && key="AUTHORS"
+            d["$key"]="$value"
+            decho "Set d[$key]='$value'"
+        fi
+    done < "$tmp_file"
+    rm "$tmp_file" || decho "Note: Failed to remove temp file '$tmp_file' (non-critical)"
 
-	move_or_link_file "$current_ebook_path" "$new_path"
+    # Fallbacks for TITLE and AUTHORS with unbound variable protection
+    decho "Checking TITLE and AUTHORS..."
+    if [[ -z "${d[TITLE]+x}" || -z "${d[AUTHORS]+x}" ]]; then
+        decho "Falling back to ebook-meta or other keys..."
+        local ebookmeta=$(ebook-meta "$current_ebook_path" 2>/dev/null) || decho "Warning: ebook-meta failed, using defaults"
+        [[ -z "${d[TITLE]+x}" ]] && d[TITLE]=$(echo "$ebookmeta" | grep_meta_val "Title") || d[TITLE]="${d[OF_TITLE]:-Unknown Title}"
+        [[ -z "${d[AUTHORS]+x}" ]] && d[AUTHORS]=$(echo "$ebookmeta" | grep_meta_val "Author" | sed 's/ & .*//') || d[AUTHORS]="${d[OF_AUTHORS]:-Unknown Author}"
+    fi
 
-	if [[ "$KEEP_METADATA" != true ]]; then
-		decho "Removing metadata file '$current_metadata_path'..."
-		rm "$current_metadata_path"
-	else
-		decho "Moving metadata file '$current_metadata_path' to '${new_path}.${OUTPUT_METADATA_EXTENSION}'..."
-		if [[ "$DRY_RUN" != true ]]; then
-			mv --no-clobber "$current_metadata_path" "${new_path}.${OUTPUT_METADATA_EXTENSION}"
-		else
-			rm "$current_metadata_path"
-		fi
-	fi
+    # Debug metadata
+    decho "Variables that will be used for the new filename construction:"
+    for key in "${!d[@]}"; do
+        echo "${d[$key]}" | debug_prefixer "    $key" 25
+    done
+
+    # Construct filename
+    local authors="${d[AUTHORS]:-Unknown Author}"
+    local title="${d[TITLE]:-Unknown Title}"
+    local published="${d[PUBLISHED]:-}"
+    local isbn="${d[ISBN]:-}"
+    if [ -z "$isbn" ] && [ -n "${d[IDENTIFIERS]+x}" ]; then
+        isbn=$(echo "${d[IDENTIFIERS]}" | grep -o 'isbn:[0-9-]\+' | cut -d: -f2 | head -n1 || true)
+        decho "Extracted ISBN from IDENTIFIERS: '$isbn' (empty if no match)"
+    fi
+    authors=$(echo "$authors" | tr -d '/\\:*?"<>|' | cut -c 1-50)
+    title=$(echo "$title" | tr -d '/\\:*?"<>|' | cut -c 1-100)
+    published=$(echo "$published" | sed 's/[T:+].*//; s/[^0-9-]//g' | cut -c 1-10) # e.g., 20240317
+    isbn=$(echo "$isbn" | tr -d '/\\:*?"<>|' | cut -c 1-13)
+    local new_name="${authors} - ${title}${published:+ ($published)}${isbn:+ [$isbn]}.${d[EXT]}"
+    decho "Constructed new filename: '$new_name'"
+
+    # Build and validate path
+    local new_path="$new_folder/$new_name"
+    if [ ${#new_name} -gt 250 ]; then
+        decho "WARNING: Filename too long (${#new_name} chars), truncating..."
+        new_name="${authors} - ${title:0:50}${published:+ ($published)}[${d[EXT]}"
+        new_path="$new_folder/$new_name"
+    fi
+    local counter=1 base_path="$new_path"
+    while [ -e "$new_path" ]; do
+        new_path="${base_path%.*}_$counter.${d[EXT]}"
+        ((counter++))
+    done
+
+    echo -n "$new_path"
+    decho "Attempting to move '$current_ebook_path' to '$new_path'..."
+    if [[ "$SYMLINK_ONLY" == true ]]; then
+        decho "Symlinking file '$current_ebook_path' to '$new_path'..."
+        ln -s "$(realpath "$current_ebook_path")" "$new_path" || { decho "ERROR: Failed to symlink file"; exit 1; }
+    else
+        decho "Moving file '$current_ebook_path' to '$new_path'..."
+        mv --no-clobber "$current_ebook_path" "$new_path" || { decho "ERROR: Failed to move file - check permissions or disk space"; exit 1; }
+    fi
+
+    if [[ "$KEEP_METADATA" != true ]]; then
+        decho "Removing metadata file '$current_metadata_path'..."
+        rm "$current_metadata_path" 2>/dev/null || decho "Note: Metadata file already removed"
+    else
+        decho "Moving metadata to '${new_path}.${OUTPUT_METADATA_EXTENSION}'..."
+        if [[ "$DRY_RUN" != true ]]; then
+            mv --no-clobber "$current_metadata_path" "${new_path}.${OUTPUT_METADATA_EXTENSION}" 2>/dev/null || { decho "ERROR: Failed to move metadata file"; exit 1; }
+        else
+            rm "$current_metadata_path" 2>/dev/null || decho "Note: Failed to remove metadata file in dry run"
+        fi
+    fi
 }
 
 
